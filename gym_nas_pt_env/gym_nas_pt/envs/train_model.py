@@ -35,6 +35,8 @@ def train(model, X_train, y_train, X_val, y_val, batch_size=1000, epochs=15, ver
     criterion = nn.CrossEntropyLoss(weight=weights)
     val_criterion = nn.CrossEntropyLoss()
 
+    start = datetime.now()
+
     if early_stop:
         early_stopping = EarlyStopping(patience=early_stop, verbose=False)
 
@@ -74,7 +76,6 @@ def train(model, X_train, y_train, X_val, y_val, batch_size=1000, epochs=15, ver
             top_classes = []
             targets_cumulative = []
 
-            start = datetime.now()
             with torch.no_grad():
                 for batch in iterate_minibatches(X_val, y_val, batch_size, num_batches=None):
                     x, y = batch
@@ -90,7 +91,7 @@ def train(model, X_train, y_train, X_val, y_val, batch_size=1000, epochs=15, ver
 
                     top_p, top_class = output.topk(1, dim=1)
                     top_classes.extend([top_class.item() for top_class in top_class.cpu()])
-            end = datetime.now()
+
             equals = [top_classes[i] == target for i, target in enumerate(targets_cumulative)]
             accuracy = np.mean(equals)
 
@@ -109,11 +110,14 @@ def train(model, X_train, y_train, X_val, y_val, batch_size=1000, epochs=15, ver
                                 quotechar='|', quoting=csv.QUOTE_MINIMAL)
             writer.writerow([np.mean(train_losses), np.mean(val_losses), accuracy, f1score, f1macro])
 
-            struct = None
-            crit = [f1score, np.mean(val_losses), f1macro, accuracy, np.mean(train_losses)]
-            if return_struct:
-                crit.append(struct)
-            criteria.append(crit)
+            if return_avg:
+                criteria.append(stopping_metric)
+            else:
+                struct = None
+                crit = [f1score, np.mean(val_losses), f1macro, accuracy, np.mean(train_losses)]
+                if return_struct:
+                    crit.append(struct)
+                criteria.append(crit)
 
             if early_stop:
                 early_stopping((-stopping_metric), model)
@@ -122,13 +126,22 @@ def train(model, X_train, y_train, X_val, y_val, batch_size=1000, epochs=15, ver
             if lr_schedule:
                 scheduler.step()
 
+
+    end = datetime.now()
+
     time = (end - start).total_seconds()
 
-    return criteria, time
+    if return_avg:
+        crit_stdev = np.std(criteria)
+        crit_mean = np.mean(criteria)
+
+        return crit_mean, crit_stdev, time
+    else:
+        return criteria, None, time
 
 
 def train_causal(model, X_train, y_train, X_val, y_val, stride, batch_size=1000, epochs=15, verbosity='Full', early_stop=False,
-                 lr_schedule=False, logfile='log', return_struct=False):
+                 lr_schedule=False, logfile='log', return_avg=5, return_struct=False):
 
     train_stats = np.unique([a for y in y_train for a in y], return_counts=True)[1]
     val_stats = np.unique([a for y in y_val for a in y], return_counts=True)[1]
@@ -156,6 +169,8 @@ def train_causal(model, X_train, y_train, X_val, y_val, stride, batch_size=1000,
         scheduler = torch.optim.lr_scheduler.StepLR(opt,
                                                     lr_step)  # Learning rate scheduler to reduce LR every 100 epochs
 
+    if return_avg:
+        criteria = deque([0], maxlen=return_avg)
     else:
         criteria = []
 
@@ -165,8 +180,8 @@ def train_causal(model, X_train, y_train, X_val, y_val, stride, batch_size=1000,
             train_losses = []
             model.train()
 
-            for batch in iterate_minibatches_2D(X_train, y_train, batch_size, stride, num_batches=1,
-                                                batchlen=10, drop_last=True):
+            for batch in iterate_minibatches_2D(X_train, y_train, batch_size, stride, num_batches=2,
+                                                batchlen=5, drop_last=True):
                 opt.zero_grad()
 
                 x, y, pos = batch
@@ -194,8 +209,8 @@ def train_causal(model, X_train, y_train, X_val, y_val, stride, batch_size=1000,
             targets_cumulative = []
 
             with torch.no_grad():
-                for batch in iterate_minibatches_2D(X_val, y_val, batch_size, stride, num_batches=1,
-                                                    batchlen=10, drop_last=True):
+                for batch in iterate_minibatches_2D(X_val, y_val, batch_size, stride, num_batches=2,
+                                                    batchlen=5, drop_last=True):
                     x, y, pos = batch
 
                     inputs, targets = torch.from_numpy(x), torch.from_numpy(y)
@@ -233,11 +248,14 @@ def train_causal(model, X_train, y_train, X_val, y_val, stride, batch_size=1000,
                                 quotechar='|', quoting=csv.QUOTE_MINIMAL)
             writer.writerow([np.mean(train_losses), np.mean(val_losses), accuracy, f1score, f1macro])
 
-            struct = None
-            crit = [f1score, np.mean(val_losses), f1macro, accuracy, np.mean(train_losses)]
-            if return_struct:
-                crit.append(struct)
-            criteria.append(crit)
+            if return_avg:
+                criteria.append(stopping_metric)
+            else:
+                struct = None
+                crit = [f1score, np.mean(val_losses), f1macro, accuracy, np.mean(train_losses)]
+                if return_struct:
+                    crit.append(struct)
+                criteria.append(crit)
 
             if early_stop:
                 early_stopping((-stopping_metric), model)
@@ -252,7 +270,13 @@ def train_causal(model, X_train, y_train, X_val, y_val, stride, batch_size=1000,
 
     time = (end - start).total_seconds()
 
-    return criteria, time
+    if return_avg:
+        crit_stdev = np.std(criteria)
+        crit_mean = np.mean(criteria)
+
+        return crit_mean, crit_stdev, time
+    else:
+        return criteria, None, time
 
 if __name__ == '__main__':
     pass

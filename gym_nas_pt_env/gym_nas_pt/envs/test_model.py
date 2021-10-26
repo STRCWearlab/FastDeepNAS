@@ -81,7 +81,7 @@ def test_causal(model, X_test, y_test, stride, batch_size=1000, verbosity='silen
 
     with torch.no_grad():
         with open('{}.csv'.format(log_name), 'a', newline='') as csvfile:
-            for batch in iterate_minibatches_test(X_test, y_test, batch_size, stride):
+            for batch in iterate_minibatches_2D(X_test, y_test, batch_size, stride, batchlen=5, drop_last=True):
                 x, y, pos = batch
 
                 inputs, targets = torch.from_numpy(x), torch.from_numpy(y)

@@ -5,11 +5,13 @@ if __package__ is None or __package__ == '':
     # uses current directory visibility
     from model_generator import *
     from NSC import *
+    from config import *
     from train_model import *
     from nas_utils import *
     from graph_vis import *
     from preprocess_data import *
     from test_model import *
+    from flops_bench_utils import *
 else:
     # uses current package visibility
     from .model_generator import *
@@ -20,8 +22,10 @@ else:
     from .graph_vis import *
     from .preprocess_data import *
     from .test_model import *
+    from .flops_bench_utils import *
 
 import torch
+from ast import literal_eval as make_tuple
 from thop import profile
 
 try:
@@ -36,8 +40,8 @@ class NASPtEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     def __init__(self, max_index=11, state_encoding='int', action_encoding='int', conv_filters=N_KERNELS_CONV,
-                 ch='fast', get_data=None, sub='fast', classifier='Linear', window_step=8,
-                 window_size=16, n_epochs_train=15):
+                 ch='fast', get_data=None, sub='fast', use_redef_reward=True, classifier='Linear', window_step=8,
+                 window_size=16, n_epochs_train=15, for_predictor=False):
 
         channels_dict = {'fast': 12, 'all': 113}
         self.n_channels = channels_dict[ch]
@@ -85,6 +89,15 @@ class NASPtEnv(gym.Env):
 
         self.current_index = self.internal_state[-1].index  # Initialise exposed representation of state
 
+        self.use_redef_reward = use_redef_reward
+        if use_redef_reward:
+            if classifier == 'Linear':
+                self.mu = 1
+                self.rho = 100
+            if classifier == 'LSTM':
+                self.mu = 0
+                self.rho = 0
+
         try:
             self.evaluated_models = self.load_evaluated_models()
         except FileNotFoundError:
@@ -93,8 +106,9 @@ class NASPtEnv(gym.Env):
 
         self.classifier = classifier
         self.n_epochs_train = n_epochs_train
+        self.for_predictor = for_predictor
 
-    def evaluate(self, arch, verbosity=VERBOSITY):
+    def evaluate(self, arch, return_avg=5, return_struct=False, verbosity=VERBOSITY):
 
         """ Call an external script to evaluate a pytorch model on the target dataset.
             Return done = True if criteria has not improved in tolerance iterations. """
@@ -109,8 +123,8 @@ class NASPtEnv(gym.Env):
                                          self.classifier).cuda()
         # We will get a zero division error if there are too many pooling layers
         except ZeroDivisionError:
-            criteria = (0, None, None, None)
-            self.evaluated_models[self.spec.hashable] = criteria
+            criteria = 0
+            self.evaluated_models[self.spec.hashable] = (criteria, 0, None, None, None)
 
             if verbosity == 'full' or verbosity == 'quiet':
                 print('Rejecting invalid model due to ZeroDivisionError, setting reward to {}.\
@@ -125,22 +139,27 @@ class NASPtEnv(gym.Env):
                     print('Evaluating architecture:', self.spec.hashable)
 
                 if self.classifier == 'LSTM':
-                    criteria, inf_time = train_causal(self.model, self.X_train, self.y_train,
-                                                        self.X_val, self.y_val, self.args['window_step'],
-                                                        epochs=n_epochs, verbosity=verbosity)
+                    criteria, stdev, train_time = train_causal(self.model, self.X_train, self.y_train,
+                                                               self.X_val, self.y_val, self.args['window_step'],
+                                                               epochs=n_epochs, verbosity=verbosity,
+                                                               return_avg=return_avg, return_struct=return_struct)
 
                 else:
-                    criteria, inf_time = train(self.model, self.X_train, self.y_train,
-                                                 self.X_val, self.y_val, epochs=n_epochs,
-                                                 verbosity=verbosity)
+                    criteria, stdev, train_time = train(self.model, self.X_train, self.y_train,
+                                                        self.X_val, self.y_val, epochs=n_epochs,
+                                                        verbosity=verbosity, return_avg=return_avg,
+                                                        return_struct=return_struct)
                 density = self.get_density()
                 FLOPs = self.get_flops()
-                criteria = (criteria, inf_time, density, FLOPs)
-                self.evaluated_models[self.spec.hashable] = criteria
+                self.evaluated_models[self.spec.hashable] = (criteria, stdev, train_time, density, FLOPs)
+                if self.use_redef_reward:
+                    criteria = self.redefined_reward(criteria, stdev)
+                if self.for_predictor:
+                    criteria = (np.array(criteria), density, FLOPs)
 
             except RuntimeError:
-                criteria = (0, None, None, None)
-                self.evaluated_models[self.spec.hashable] = criteria
+                criteria = 0
+                self.evaluated_models[self.spec.hashable] = (criteria, 0, None, None, None)
                 if verbosity == 'full' or verbosity == 'quiet':
                     print('Rejecting invalid model due to RuntimeError, setting reward to {}.\
                            This can sometimes happen due to too many stacked \
@@ -149,11 +168,15 @@ class NASPtEnv(gym.Env):
                            probably a device mismatch.'.format(criteria))
 
         else:
-            criteria = self.evaluated_models[self.spec.hashable]
+            criteria, stdev, inf_time, density, FLOPs = self.evaluated_models[self.spec.hashable]
+            if self.use_redef_reward:
+                criteria = self.redefined_reward(criteria, stdev)
+            if self.for_predictor:
+                criteria = (np.array(criteria), density, FLOPs)
 
         return criteria
 
-    def step(self, action, verbosity=VERBOSITY, n_avg=1, eval=True):
+    def step(self, action, verbosity=VERBOSITY, n_avg=1, eval=True, return_avg=5, return_struct=False):
 
         """ Perform an action - in this case generate and evaluate a new architecture. """
 
@@ -169,7 +192,7 @@ class NASPtEnv(gym.Env):
 
             if action.type == 'Terminal' or self.current_index == self.max_index:
                 if eval:
-                    reward = self.evaluate(self.internal_state)
+                    reward = self.evaluate(self.internal_state, return_avg, return_struct)
                 else:
                     reward = 0
                 done = True
@@ -229,16 +252,14 @@ class NASPtEnv(gym.Env):
             X_test, y_test = load_data('{}_test'.format(self.ch), self.args['window_size'], self.args['window_step'])
 
         if self.classifier == 'LSTM':
-            criteria_full, inf_time_full, targets_full, pred_full = test_causal(model, X_test, y_test,
-                                                                                self.args['window_step'],
-                                                                                verbosity='Full')
+            criteria_full, inf_time_full, targets_full, pred_full = test_causal(model, X_test, y_test, self.args['window_step'],
+                                                            verbosity='Full')
 
             state_dict = torch.load('checkpoint.pt')
             model.load_state_dict(state_dict)
 
-            criteria_early, inf_time_early, targets_early, pred_early = test_causal(model, X_test, y_test,
-                                                                                    self.args['window_step'],
-                                                                                    verbosity='Full')
+            criteria_early, inf_time_early, targets_early, pred_early = test_causal(model, X_test, y_test, self.args['window_step'],
+                                                            verbosity='Full')
         else:
             criteria_full, inf_time_full, targets_full, pred_full = test(model, X_test, y_test, verbosity='Full')
 
@@ -307,7 +328,8 @@ class NASPtEnv(gym.Env):
         # Pass one batch through the network to record FLOPs
         if self.classifier == 'LSTM':
             for batch, _, _ in iterate_minibatches_2D(self.X_train, self.y_train, BATCH_SIZE, self.args['window_step'],
-                                                      num_batches=1, batchlen=1):
+                                                   num_batches=1, batchlen=1):
+
                 batch = torch.from_numpy(batch).cuda()
                 h = model.init_hidden(BATCH_SIZE)
                 macs, params = profile(model, inputs=(batch, h,), verbose=False)
@@ -324,6 +346,16 @@ class NASPtEnv(gym.Env):
             model = self.spec
 
         return model.density()
+
+    def redefined_reward(self, reward, stdev):
+
+        FLOPs = self.get_flops()
+        density = self.get_density()
+
+        if FLOPs != 0:
+            return (reward * 100 + self.mu * np.log(FLOPs) + self.rho * stdev) / 100
+        else:
+            return (reward * 100 + self.rho * stdev) / 100
 
     def save_evaluated_models(self, name='evaluated_models.csv'):
 
