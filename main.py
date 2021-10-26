@@ -25,7 +25,7 @@ def interact(agent, env, n_episodes=5000, max_index=8):
         score = 0
         while not done:
             action = agent.act(state)
-            next_state, reward, done, _ = env.step(action, return_avg=False)
+            next_state, reward, done, _ = env.step(action)
             reward = agent.step(state, action, reward, next_state, done)
             state = next_state
             if reward >= 0:
